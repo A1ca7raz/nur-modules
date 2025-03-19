@@ -53,7 +53,7 @@ rec {
   fileModule = { name, config, lib, pkgs, ... }:
     let
       inherit (lib) mkEnableOption mkOption types concatMapStrings traceVal;
-      cmd = args: ''kwriteconfig5 --file "$out" ${args}'';
+      cmd = args: ''kwriteconfig6 --file "$out" ${args}'';
       mkScript = x: (cmd x.args) + "\n";
 
       itemType = types.submodule itemModule;
@@ -103,7 +103,7 @@ rec {
 
       config = {
         path = pkgs.runCommand name {
-          nativeBuildInputs = [ pkgs.libsForQt5.kconfig ];
+          nativeBuildInputs = [ pkgs.kdePackages.kconfig ];
         } (
           if config.debug
           then traceVal config.script
