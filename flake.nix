@@ -4,7 +4,13 @@
   outputs = { self }:
     let
       lib = import ./lib.nix;
+
+      modules = lib.importModules ./modules;
     in {
-      nixosModules = lib.importModules ./modules;
+      nixosModules = modules // {
+        all = { ... }: {
+          imports = builtins.attrValues modules;
+        };
+      };
     };
 }
