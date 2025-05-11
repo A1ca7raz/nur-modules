@@ -1,8 +1,18 @@
 { pkgs, config, lib, ... }:
-with lib; let
+let
+  inherit (lib)
+    mkOption
+    types
+    mkIf
+    foldlAttrs
+    foldl
+  ;
+
   cfg = config.utils.netns;
 
   inherit (import ./types.nix) bridgeModule;
+
+  ip = "${pkgs.iproute2}/bin/ip";
 in {
   options.utils.netns.bridge = mkOption {
     type = with types; attrsOf (submodule bridgeModule);
@@ -14,23 +24,18 @@ in {
     systemd.services = {
       "netns-bridge@" = {
         description = "Named network namespace bridge %I";
-        path = [ pkgs.iproute2 ];
 
-        unitConfig = {
-          StopWhenUnneeded = true;
-        };
+        unitConfig.StopWhenUnneeded = true;
 
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          ExecStop = "${pkgs.iproute2}/bin/ip link del vnet-%i";
+          ExecStart = [
+            "${ip} link add vnet-%i type bridge"
+            "${ip} link set dev vnet-%i up"
+          ];
+          ExecStop = "${ip} link del vnet-%i";
         };
-        
-        script = ''
-          ip link add vnet-$1 type bridge
-          ip link set dev vnet-$1 up
-        '';
-        scriptArgs = "%i";
       };
     } // (foldlAttrs (acc: name: val:
       {
@@ -38,11 +43,11 @@ in {
           overrideStrategy = "asDropin";
           path = [ pkgs.iproute2 ];
 
-          postStart = foldl (acc: ip:
-            ''
-              ip addr add ${ip} dev vnet-${name}
-            '' + acc
-          ) "" val.ipAddrs;
+          serviceConfig.ExecStartPost = foldl (acc: ip_:
+            [
+              "${ip} addr add ${ip_} dev vnet-${name}"
+            ] ++ acc
+          ) [] val.ipAddrs;
         };
       } // acc
     ) {} cfg.bridge);
