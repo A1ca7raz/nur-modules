@@ -1,8 +1,8 @@
-{ pkgs, config, lib, tools, ... }:
+{ pkgs, config, lib, ... }:
 with lib; let
   cfg = config.utils.netns;
 
-  inherit (tools) removeCIDRSuffixes;
+  inherit (lib) removeCIDRSuffixes;
 
   inherit (import ./types.nix) vethModule;
   vethType = types.submodule vethModule;
