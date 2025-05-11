@@ -29,7 +29,7 @@ in rec {
     in
       filter (i: items.${i} == type) (attrNames items);
 
-  importModules = path:
+  imports = path:
     let
       dir = readDir path;
     in foldl'

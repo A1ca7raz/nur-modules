@@ -1,11 +1,11 @@
 {
   description = "A1ca7raz's NUR for Modules";
 
-  outputs = { self }:
+  outputs = { ... }:
     let
-      lib = import ./lib.nix;
+      inherit (import ./lib.nix) imports;
 
-      modules = lib.importModules ./modules;
+      modules = imports ./modules;
     in {
       nixosModules = modules // {
         all = { ... }: {
