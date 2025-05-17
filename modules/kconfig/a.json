@@ -1,0 +1,38 @@
+{
+  "Libinput/1739/52781/MSFT0004:00 06CB:CE2D Touchpad": {
+    "safa\\sd": {
+      "value": "asd\\ds",
+      "immutable": false,
+      "shellExpand": false,
+      "persistent": false,
+      "escapeValue": false,
+      "escapeKey": false
+    },
+    "qqs\\safa\\sd": {
+      "value": "asd\\ds",
+      "immutable": false,
+      "shellExpand": false,
+      "persistent": false,
+      "escapeValue": false,
+      "escapeKey": false
+    }
+  },
+  "General/qws": {
+    "safa\\sd": {
+      "value": "asd\\ds",
+      "immutable": false,
+      "shellExpand": false,
+      "persistent": false,
+      "escapeValue": false,
+      "escapeKey": false
+    },
+    "qqs\\safa\\sd": {
+      "value": "asd\\ds",
+      "immutable": false,
+      "shellExpand": false,
+      "persistent": false,
+      "escapeValue": false,
+      "escapeKey": false
+    }
+  }
+}

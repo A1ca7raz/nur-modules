@@ -1,142 +1,123 @@
-rec {
-  itemModule = { config, lib, ... }:
-    let
-      inherit (lib) mkOption types fold concatStringsSep escapeShellArg;
+# https://github.com/nix-community/plasma-manager/blob/d226a67fdf835be15e5270c36406e922f4b6fa84/lib/types.nix
+{ lib, pkgs }:
+let
+  inherit (lib)
+    types
+    mkOption
+    getExe
+  ;
 
-      groupstr = concatStringsSep " " (fold (x: y: [''--group ${escapeShellArg x}''] ++ y) [] config.groups);
-    in {
-      options = {
-        groups = mkOption {
-          type = with types; coercedTo str (x: [x]) (listOf str);
-          default = config.g;
-          description = "Groups to look in";
-        };
+  inherit (types)
+    nullOr
+    oneOf
+    bool
+    float
+    int
+    str
+    submodule
+    coercedTo
+    attrsOf
+    submoduleWith
+    path
+    package
+  ;
 
-        key = mkOption {
-          type = types.str;
-          default = config.k;
-          description = "Key to look for";
-        };
-        
-        value = mkOption {
-          type = types.str;
-          default = config.v;
-          description = "The value to write";
-        };
+  inherit (import ./lib.nix { inherit pkgs; })
+    writeConfigScript
+    writeConfig
+  ;
+in rec {
+  ##############################################################################
+  # Types for storing settings.
+  basicSettingsType = (
+    nullOr (oneOf [
+      bool
+      float
+      int
+      str
+    ])
+  );
 
-        g = mkOption {
-          type = with types; coercedTo str (x: [x]) (listOf str);
-          default = [];
-          description = "Groups to look in";
-        };
-        k = mkOption {
-          type = types.str;
-          default = "";
-          description = "Key to look for";
-        };
-        v = mkOption {
-          type = types.str;
-          default = "";
-          description = "The value to write";
-        };
-
-        args = mkOption {
-          type = types.str;
-          # NOTE: need to escape '\'
-          default = "${groupstr} --key ${escapeShellArg config.key} ${escapeShellArg config.value}";
-          visible = false;
-          readOnly = true;
-        };
+  advancedSettingsType = submodule {
+    options = {
+      value = mkOption {
+        type = basicSettingsType;
+        default = null;
+        description = "The value for some key.";
+      };
+      immutable = mkOption {
+        type = bool;
+        default = false;
+        description = ''
+          Whether to make the key immutable. This corresponds to adding [$i] to
+          the end of the key.
+        '';
+      };
+      shellExpand = mkOption {
+        type = bool;
+        default = false;
+        description = ''
+          Whether to mark the key for shell expansion. This corresponds to
+          adding [$e] to the end of the key.
+        '';
+      };
+      persistent = mkOption {
+        type = bool;
+        default = false;
+        description = ''
+          When overrideConfig is enabled and the key is persistent,
+          plasma-manager will leave it unchanged after activation.
+        '';
+      };
+      escapeValue = mkOption {
+        type = bool;
+        default = true;
+        description = ''
+          Whether to escape the value according to kde's escape-format. See:
+          https://invent.kde.org/frameworks/kconfig/-/blob/v6.7.0/src/core/kconfigini.cpp?ref_type=tags#L880-945
+          for info about this format.
+        '';
+      };
+      escapeKey = mkOption {
+        type = bool;
+        default = false;
       };
     };
-  
-  fileModule = { name, config, lib, pkgs, ... }:
-    let
-      inherit (lib) mkEnableOption mkOption types concatMapStrings traceVal;
-      cmd = args: ''kwriteconfig6 --file "$out" ${args}'';
-      mkScript = x: (cmd x.args) + "\n";
+  };
 
-      itemType = types.submodule itemModule;
-    in {
-      options = {
-        items = mkOption {
-          type = types.listOf itemType;
-          default = [];
-          description = "list of KDE configuration file item";
-        };
+  coercedSettingsType =
+    coercedTo basicSettingsType (value: { inherit value; }) advancedSettingsType;
 
-        extraScript = mkOption {
-          type = types.str;
-          default = "";
-          description = "extra script run after kwriteconfig";
-        };
-
-        extraScriptPre = mkOption {
-          type = types.str;
-          default = "";
-          description = "extra script run before kwriteconfig";
-        };
-
-        extraScriptPost = mkOption {
-          type = types.str;
-          default = config.extraScript;
-          description = "extra script run after kwriteconfig";
-        };
-
-        script = mkOption {
-          type = types.str;
-          default = config.extraScriptPre
-            + "\n" + (concatMapStrings mkScript config.items)
-            + "\n" + config.extraScriptPost;
-          visible = false;
-          readOnly = true;
-        };
-
-        path = mkOption {
-          type = types.path;
-          visible = false;
-          readOnly = true;
-        };
-
-        debug = mkEnableOption "enable debug for ${name}";
+  fileModule = { name, config, ... }: {
+    options = {
+      content = mkOption {
+        type = attrsOf (attrsOf coercedSettingsType);
+        default = {};
       };
 
-      config = {
-        path = pkgs.runCommand name {
-          nativeBuildInputs = [ pkgs.kdePackages.kconfig ];
-        } (
-          if config.debug
-          then traceVal config.script
-          else config.script
-        );
+      script = mkOption {
+        type = package;
+        default = writeConfig name config.content;
+        visible = false;
+        readOnly = true;
+      };
+
+      path = mkOption {
+        type = path;
+        visible = false;
+        readOnly = true;
       };
     };
 
-  ruleModule = { lib, ... }:
-    let
-      inherit (lib) mkOption types;
-    in {
-      options = {
-        f = mkOption {
-          type = types.str;
-          default = "";
-          description = "Name of config file";
-        };
-        g = mkOption {
-          type = with types; coercedTo str (x: [x]) (listOf str);
-          default = [];
-          description = "Groups to look in";
-        };
-        k = mkOption {
-          type = types.str;
-          default = "";
-          description = "Key to look for";
-        };
-        v = mkOption {
-          type = types.str;
-          default = "";
-          description = "The value to write";
-        };
-      };
-    };
-} 
+    config.path = pkgs.runCommand name {
+      nativeBuildInputs = [
+        config.script
+      ];
+    } "${lib.getExe config.script} $out";
+  };
+
+  fileType = submoduleWith {
+    modules = [ fileModule ];
+    shorthandOnlyDefinesConfig = true;
+  };
+}
