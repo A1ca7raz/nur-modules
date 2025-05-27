@@ -20,7 +20,7 @@ let
   netnsAttach = pkgs.writeShellScript "netns-attach" ''
     ${ip} netns attach $1 $$
     mkdir -p /etc/netns/$1
-    touch /etc/netns/$1/resolv.conf
+    touch /etc/netns/$1/resolv.conf || true
   '';
 in {
   options.utils.netns = {
