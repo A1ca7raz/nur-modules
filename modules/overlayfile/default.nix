@@ -22,7 +22,8 @@ let
     readFile
   ;
 
-  cfg = config.environment.overlay.users;
+  _cfg = config.environment.overlay;
+  cfg = _cfg.users;
 
   inherit (import ./lib.nix { inherit lib; }) sourceStorePath;
 
@@ -37,6 +38,14 @@ in {
       type = with types; attrsOf (attrsOf fileType);
       default = {};
       description = "Attribute set of files to link into the user home.";
+    };
+    filesystem = mkOption {
+      type = types.enum [
+        "erofs"
+        "squashfs"
+      ];
+      default = "squashfs";
+      description = "Filesystem of overlay base";
     };
   };
 
@@ -106,12 +115,17 @@ in {
             (readFile ./scripts/insert_file.sh) +
             scripts + ''
               chmod -cR +w ./build
-              ${pkgs.erofs-utils}/bin/mkfs.erofs -zlz4 "$out" ./build/
-            ''
+            '' + (
+              if _cfg.filesystem == "erofs"
+              then ''${pkgs.erofs-utils}/bin/mkfs.erofs -zlz4 "$out" ./build/''
+              else if _cfg.filesystem == "squashfs"
+              then ''${pkgs.squashfsTools}/bin/mksquashfs ./build/ "$out" -comp zstd''
+              else ""
+            )
           );
         in {
           device = pak.outPath;
-          fsType = "erofs";
+          fsType = _cfg.filesystem;
           noCheck = true;
           depends = [
             "/nix" "/run"
