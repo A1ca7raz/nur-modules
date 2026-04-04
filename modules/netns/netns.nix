@@ -1,6 +1,7 @@
 { config, lib, pkgs, ... }:
 let
   inherit (lib)
+    hasSuffix
     mkEnableOption
     mkIf
     concatStrings
@@ -68,7 +69,7 @@ in {
               pkgs.writeScript "sysctl" (
                 concatStrings (
                   mapAttrsToList (
-                    n: v: optionalString (v != null) "${n}=${if v == false then "0" else toString v}\n"
+                    n: v: optionalString (v != null || hasSuffix "net.core" n) "${n}=${if v == false then "0" else toString v}\n"
                   ) config.boot.kernel.sysctl
                 )
               )
