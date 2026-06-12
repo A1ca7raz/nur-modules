@@ -10,7 +10,7 @@ let
     optional
   ;
 
-  cfg = config.utils.netns;
+  cfg = config.utils.vnet;
 
   ip = "${pkgs.iproute2}/bin/ip";
 
@@ -24,7 +24,7 @@ let
     touch /etc/netns/$1/resolv.conf || true
   '';
 in {
-  options.utils.netns = {
+  options.utils.vnet = {
     enable = mkEnableOption "enable netns management";
   };
 
