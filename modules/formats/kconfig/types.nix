@@ -2,12 +2,10 @@
 { lib, pkgs }:
 let
   inherit (lib)
-    types
     mkOption
-    getExe
   ;
 
-  inherit (types)
+  inherit (lib.types)
     nullOr
     oneOf
     bool
@@ -23,7 +21,6 @@ let
   ;
 
   inherit (import ./lib.nix { inherit pkgs; })
-    writeConfigScript
     writeConfig
   ;
 in rec {
