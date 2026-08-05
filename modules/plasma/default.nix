@@ -1,7 +1,0 @@
-{ ... }:
-{
-  imports = [
-    ./kconfig
-    ./monitors
-  ];
-}
