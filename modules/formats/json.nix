@@ -7,38 +7,60 @@ let
 
   inherit (lib.types)
     str
-    path
+    bool
     submodule
     attrsOf
   ;
 
   json = pkgs.formats.json {};
 
-  jsonType = { name, config, ... }: {
-    options = {
-      name = mkOption {
-        type = str;
-        default = "${name}.json";
-      };
-      content = mkOption {
-        type = json.type;
-        default = {};
-      };
-      path = mkOption {
-        type = path;
-        readOnly = true;
-      };
-      text = mkOption {
-        type = str;
-        readOnly = true;
-      };
-    };
+  inherit (import ./secrets-replacement.nix { inherit lib pkgs; })
+    genSecretsReplacementSnippet
+  ;
 
-    config = {
-      path = json.generate config.name config.content;
-      text = generators.toJSON {} config.content;
+  jsonType = { name, config, ... }:
+    let
+      templatePath = json.generate config.name config.content;
+    in {
+      options = {
+        name = mkOption {
+          type = str;
+          default = "${name}.json";
+        };
+        content = mkOption {
+          type = json.type;
+          default = {};
+        };
+        enableSecretsReplacement = mkOption {
+          type = bool;
+          default = false;
+        };
+        path = mkOption {
+          type = str;
+          default = toString templatePath;
+        };
+        text = mkOption {
+          type = str;
+          readOnly = true;
+        };
+        script = mkOption {
+          type = str;
+          readOnly = true;
+        };
+      };
+
+      config = {
+        text = generators.toJSON {} config.content;
+        script = if config.enableSecretsReplacement
+          then genSecretsReplacementSnippet {
+            format = "json";
+            content = config.content;
+            input = templatePath;
+            output = config.path;
+          }
+          else "";
+      };
     };
-  };
 in {
   options.utils.json = mkOption {
     type = attrsOf (submodule jsonType);
