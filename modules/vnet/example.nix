@@ -1,88 +1,128 @@
 { pkgs, ... }:
 {
-  # utils.vnet only checks this dependency; it never enables networkd itself.
   systemd.network.enable = true;
+  networking.nftables.enable = true;
+
+  systemd.network.networks.default = {
+    matchConfig.Name = "eth0";
+    DHCP = "yes";
+  };
 
   services.caddy = {
     enable = true;
     virtualHosts.":80".extraConfig = ''
       handle_path /app1/* {
-        reverse_proxy 10.255.0.2:8080
+        reverse_proxy 169.254.100.2:8080
       }
 
       handle_path /app2/* {
-        reverse_proxy 10.255.0.3:8080
+        reverse_proxy 169.254.100.3:8080
+      }
+
+      handle_path /host-app/* {
+        reverse_proxy 169.254.100.4:8080
       }
     '';
   };
 
   systemd.services = {
-    "direct-app" = {
-      wantedBy = [ "multi-user.target" ];
-      serviceConfig.ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
-    };
-
     app1 = {
       wantedBy = [ "multi-user.target" ];
-      serviceConfig = {
-        ExecStart = "${pkgs.python3}/bin/python -m http.server 8080 --bind 10.255.0.2";
-        Restart = "on-failure";
-      };
+      serviceConfig.ExecStart =
+        "${pkgs.python3}/bin/python -m http.server 8080 --bind 169.254.100.2";
     };
 
     app2 = {
       wantedBy = [ "multi-user.target" ];
-      serviceConfig = {
-        ExecStart = "${pkgs.python3}/bin/python -m http.server 8080 --bind 10.255.0.3";
-        Restart = "on-failure";
-      };
+      serviceConfig.ExecStart =
+        "${pkgs.python3}/bin/python -m http.server 8080 --bind 169.254.100.3";
+    };
+
+    host-app = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig.ExecStart =
+        "${pkgs.python3}/bin/python -m http.server 8080 --bind 169.254.100.4";
     };
   };
 
   utils.vnet = {
     enable = true;
 
+    # The uplink requests an IA_PD /64. No upstream RA is bridged into a
+    # service namespace; vnet assigns routed /128 addresses instead.
+    prefixDelegations.wan = {
+      network = "default";
+      hint = "::/64";
+    };
+
+    egress = {
+      enable = true;
+      uplink = "eth0";
+      ipv4 = {
+        pool = "169.254.200.0/24";
+        masquerade = true;
+      };
+      ipv6.prefixDelegation = "wan";
+      monitoring.enable = true;
+    };
+
     gateways = {
-      public.addresses = "10.10.0.1/24";
-      internal.addresses = "10.20.0.1/24";
+      public.addresses = "198.18.0.1/24";
+      internal.addresses = "198.18.1.1/24";
     };
 
     services = {
-      # One service can connect to multiple gateways.
-      "direct-app".interfaces = {
-        public = {
-          gateway = "public";
-          addresses = "10.10.0.10/24";
+      proxy = {
+        unit = "caddy";
+        endpoint = "169.254.100.1";
+        # Gateway interfaces without a default route are automatically treated
+        # as inbound/reply-only, regardless of whether the service has egress.
+        interfaces = {
+          public = {
+            gateway = "public";
+            addresses = "198.18.0.2/24";
+          };
+          internal = {
+            gateway = "internal";
+            addresses = "198.18.1.2/24";
+          };
+          egress = {
+            peer = "host";
+            defaultRoute = true;
+          };
+        };
+      };
 
-          # Infer 10.10.0.1 from gateways.public.addresses.
+      app1.interfaces = {
+        proxy = {
+          addresses = "169.254.100.2";
+          peer = "proxy";
+        };
+        egress = {
+          peer = "host";
           defaultRoute = true;
         };
-
-        internal = {
-          gateway = "internal";
-          addresses = "10.20.0.10/24";
-        };
       };
 
-      # Caddy owns one reusable /32 endpoint and also connects to a gateway.
-      caddy = {
-        endpoint = "10.255.0.1";
-        interfaces.public = {
-          gateway = "public";
-          addresses = "10.10.0.2/24";
+      app2.interfaces = {
+        proxy = {
+          addresses = "169.254.100.3";
+          peer = "proxy";
+        };
+        egress = {
+          peer = "host";
           defaultRoute = true;
         };
       };
 
-      # Both applications reuse caddy.endpoint, so peer.endpoint is omitted.
-      app1.interfaces.proxy = {
-        addresses = "10.255.0.2";
-        peer = "caddy";
-      };
-
-      app2.interfaces.proxy = {
-        addresses = "10.255.0.3";
-        peer = "caddy";
+      # This service stays in the host namespace. Its WebUI address is exposed
+      # only through the shared host-to-proxy peer and is protected by nftables.
+      host-app = {
+        privateNetwork = false;
+        interfaces.proxy = {
+          addresses = "169.254.100.4";
+          peer = "proxy";
+        };
       };
     };
   };

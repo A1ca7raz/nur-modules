@@ -4,6 +4,7 @@
     ./netns.nix
     ./gateway.nix
     ./service.nix
+    ./egress.nix
   ];
 
   config = lib.mkIf config.utils.vnet.enable {
