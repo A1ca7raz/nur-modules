@@ -6,8 +6,10 @@
 }:
 let
   inherit (lib)
+    concatMap
     concatMapStrings
     concatStringsSep
+    filter
     filterAttrs
     mapAttrs'
     mapAttrsToList
@@ -17,29 +19,48 @@ let
     mkOption
     nameValuePair
     optionalAttrs
+    optionalString
     types
     unique
     ;
 
   cfg = config.utils.vnet;
   enabledServices = filterAttrs (_: service: service.enable) cfg.services;
+  enabledGateways = filterAttrs (_: gateway: gateway.enable) cfg.gateways;
   enabledPrefixDelegations = filterAttrs (_: delegation: delegation.enable) cfg.prefixDelegations;
   vnetLib = import ./lib.nix { inherit lib; };
 
   inherit (vnetLib)
     allocateEgressLinks
+    egressLinkServiceName
+    ipv4Network
     parseIPv4Pool
     prefixDelegationDevice
-    shortHash
+    sanitizeName
     ;
 
   ip = "${pkgs.iproute2}/bin/ip";
   deviceUnit = interface:
     "sys-subsystem-net-devices-${utils.escapeSystemdPath interface}.device";
 
-  egressLinks = allocateEgressLinks cfg enabledServices;
+  egressLinks = allocateEgressLinks cfg cfg.services;
+  internetLinks = filter (link: link.internet) egressLinks;
+  ipv6Links = filter (link: link.ipv6) egressLinks;
   ipv4Pool = parseIPv4Pool cfg.egress.ipv4.pool;
   hostAddress = ipv4Pool.addressAt 1;
+  addressIP = address: builtins.head (lib.splitString "/" address);
+
+  businessDestinations = concatMap
+    (
+      gatewayName:
+      builtins.map
+        (address: {
+          device = enabledGateways.${gatewayName}.device;
+          network = ipv4Network address;
+        })
+        (filter (address: !(lib.hasInfix ":" address)) enabledGateways.${gatewayName}.addresses)
+    )
+    (builtins.attrNames enabledGateways);
 
   prefixDelegationName = cfg.egress.ipv6.prefixDelegation;
   hasPrefixDelegation =
@@ -47,52 +68,75 @@ let
     && builtins.hasAttr prefixDelegationName enabledPrefixDelegations;
   pdDevice =
     if hasPrefixDelegation then prefixDelegationDevice prefixDelegationName else "";
+  prefixDelegationDevices = map prefixDelegationDevice (builtins.attrNames enabledPrefixDelegations);
 
   counterName = link: family: direction:
     "vnet_${lib.replaceStrings [ "-" "." ] [ "_" "_" ] link.serviceName}_${family}_${direction}";
-  counterStatement = link: family: direction:
-    if cfg.egress.monitoring.enable then
+  counterStatement = accounting: link: family: direction:
+    if accounting && cfg.egress.monitoring.enable then
       "counter name ${counterName link family direction}"
     else
       "";
-  counterDefinitions = concatMapStrings
-    (
-      link:
-      "${concatStringsSep "\n" (
-      map
-        (item: "counter ${counterName link item.family item.direction} { }")
-        [
-          { family = "ipv4"; direction = "tx"; }
-          { family = "ipv4"; direction = "rx"; }
-          { family = "ipv6"; direction = "tx"; }
-          { family = "ipv6"; direction = "rx"; }
-        ]
-    )}\n"
-    )
-    egressLinks;
+  counterDefinitions = optionalString cfg.egress.monitoring.enable (
+    concatMapStrings
+      (
+        link:
+        "${concatStringsSep "\n" (
+        map
+          (item: "counter ${counterName link item.family item.direction} { }")
+          [
+            { family = "ipv4"; direction = "tx"; }
+            { family = "ipv4"; direction = "rx"; }
+            { family = "ipv6"; direction = "tx"; }
+            { family = "ipv6"; direction = "rx"; }
+            { family = "business"; direction = "tx"; }
+            { family = "business"; direction = "rx"; }
+          ]
+      )}\n"
+      )
+      egressLinks
+  );
 
-  forwardRules = concatMapStrings
-    (
-      link:
-      let
-        hostInterface = link.targetInterface;
-      in
-      ''
-        # Only addresses routed back through this service's egress peer may
-        # leave it; this prevents a namespace from spoofing a business address.
-        iifname "${hostInterface}" fib saddr . iif oif missing drop
+  makeForwardRules = accounting:
+    concatMapStrings
+      (
+        link:
+        let
+          hostInterface = link.targetInterface;
+          businessRules = concatMapStrings
+            (
+              destination: ''
+                meta nfproto ipv4 iifname "${hostInterface}" oifname "${destination.device}" ip daddr ${destination.network} ${counterStatement accounting link "business" "tx"} accept
+                meta nfproto ipv4 iifname "${destination.device}" oifname "${hostInterface}" ip saddr ${destination.network} ct state established,related ${counterStatement accounting link "business" "rx"} accept
+              ''
+            )
+            businessDestinations;
+        in
+        ''
+          # Only addresses routed back through this service's transit peer may
+          # leave it; this prevents a namespace from spoofing a business address.
+          iifname "${hostInterface}" fib saddr . iif oif missing drop
 
-        meta nfproto ipv4 iifname "${hostInterface}" oifname "${cfg.egress.uplink}" ${counterStatement link "ipv4" "tx"} accept
-        meta nfproto ipv6 iifname "${hostInterface}" oifname "${cfg.egress.uplink}" ${counterStatement link "ipv6" "tx"} accept
+          ${businessRules}
 
-        meta nfproto ipv4 iifname "${cfg.egress.uplink}" oifname "${hostInterface}" ct state established,related ${counterStatement link "ipv4" "rx"} accept
-        meta nfproto ipv6 iifname "${cfg.egress.uplink}" oifname "${hostInterface}" ct state established,related ${counterStatement link "ipv6" "rx"} accept
+          ${optionalString link.internet ''
+            meta nfproto ipv4 iifname "${hostInterface}" oifname "${cfg.egress.uplink}" ${counterStatement accounting link "ipv4" "tx"} accept
+            meta nfproto ipv4 iifname "${cfg.egress.uplink}" oifname "${hostInterface}" ct state established,related ${counterStatement accounting link "ipv4" "rx"} accept
+          ''}
 
-        iifname "${cfg.egress.uplink}" oifname "${hostInterface}" drop
-        iifname "${hostInterface}" drop
-      ''
-    )
-    egressLinks;
+          ${optionalString link.ipv6 ''
+            meta nfproto ipv6 iifname "${hostInterface}" oifname "${cfg.egress.uplink}" ${counterStatement accounting link "ipv6" "tx"} accept
+            meta nfproto ipv6 iifname "${cfg.egress.uplink}" oifname "${hostInterface}" ct state established,related ${counterStatement accounting link "ipv6" "rx"} accept
+          ''}
+
+          iifname "${cfg.egress.uplink}" oifname "${hostInterface}" drop
+          iifname "${hostInterface}" drop
+        ''
+      )
+      egressLinks;
+
+  forwardRules = makeForwardRules true;
+  firewallForwardRules = makeForwardRules false;
 
   inputInterfaces = concatStringsSep ", " (
     map (link: ''"${link.targetInterface}"'') egressLinks
@@ -117,13 +161,14 @@ let
 
   syncLink = link:
     let
-      stateName = shortHash "egress-state:${link.key}";
+      stateName = sanitizeName link.serviceName;
       namespace = link.serviceName;
       interface = link.interfaceName;
       hostInterface = link.targetInterface;
     in
     ''
       state_file="$state_dir/${stateName}"
+      ipv6_enabled=${if link.ipv6 then "true" else "false"}
       old_address=""
       if [[ -r "$state_file" ]]; then
         old_address="$(<"$state_file")"
@@ -136,7 +181,7 @@ let
         link_ready=true
       fi
 
-      if [[ -z "$pd_cidr" || "$link_ready" != true ]]; then
+      if [[ "$ipv6_enabled" != true || -z "$pd_cidr" || "$link_ready" != true ]]; then
         if [[ -n "$old_address" ]]; then
           if [[ -e "/run/netns/${namespace}" ]]; then
             ${ip} -n "${namespace}" -6 address del "$old_address/128" dev "${interface}" 2>/dev/null || true
@@ -160,13 +205,16 @@ let
 
   syncScript = pkgs.writeShellApplication {
     name = "vnet-egress-sync";
-    runtimeInputs = [ pkgs.gawk pkgs.iproute2 ];
+    runtimeInputs = [ pkgs.gawk ];
     text = ''
       state_dir=/run/vnet-egress
       mkdir -p "$state_dir"
 
-      pd_cidr="$(${ip} -6 -o address show dev "${pdDevice}" scope global 2>/dev/null \
-        | awk 'NR == 1 { print $4 }' || true)"
+      pd_cidr=""
+      ${optionalString hasPrefixDelegation ''
+        pd_cidr="$(${ip} -6 -o address show dev "${pdDevice}" scope global 2>/dev/null \
+          | awk 'NR == 1 { print $4 }' || true)"
+      ''}
 
       ${concatMapStrings syncLink egressLinks}
     '';
@@ -174,7 +222,6 @@ let
 
   prefixWatcher = pkgs.writeShellApplication {
     name = "vnet-egress-prefix-watch";
-    runtimeInputs = [ pkgs.iproute2 ];
     text = ''
       ${lib.getExe syncScript}
       ${ip} -6 monitor address dev "${pdDevice}" | while read -r _; do
@@ -186,7 +233,7 @@ let
   prefixDelegationNetdevs = mapAttrs'
     (
       name: _:
-        nameValuePair "40-vnet-prefix-delegation-${shortHash name}" {
+        nameValuePair "40-vnet-prefix-delegation-${sanitizeName name}" {
           netdevConfig = {
             Name = prefixDelegationDevice name;
             Kind = "dummy";
@@ -198,7 +245,7 @@ let
   prefixDelegationNetworks = mapAttrs'
     (
       name: delegation:
-        nameValuePair "40-vnet-prefix-delegation-${shortHash name}" {
+        nameValuePair "40-vnet-prefix-delegation-${sanitizeName name}" {
           matchConfig.Name = prefixDelegationDevice name;
           linkConfig.RequiredForOnline = false;
           networkConfig = {
@@ -243,10 +290,10 @@ let
     map
       (
         link:
-        nameValuePair "netns-link-${shortHash "peer-link:${link.key}"}" {
+        nameValuePair (egressLinkServiceName link.serviceName) {
           requires = [ "vnet-egress-host.service" ];
           after = [ "vnet-egress-host.service" ];
-          serviceConfig.ExecStartPost = lib.optional hasPrefixDelegation (lib.getExe syncScript);
+          serviceConfig.ExecStartPost = lib.getExe syncScript;
         }
       )
       egressLinks
@@ -316,6 +363,12 @@ in
     egress = {
       enable = mkEnableOption "host-routed vnet egress";
 
+      peerAddr = mkOption {
+        type = types.str;
+        readOnly = true;
+        description = "IPv4 address of the shared host endpoint for service transit peers.";
+      };
+
       uplink = mkOption {
         type = types.str;
         description = "Host interface used for outbound traffic.";
@@ -340,129 +393,151 @@ in
           default = null;
           description = "Name under utils.vnet.prefixDelegations used for IPv6 egress.";
         };
-        masquerade = mkOption {
-          type = types.bool;
-          default = false;
-          readOnly = true;
-          description = "IPv6 masquerading is intentionally unsupported.";
-        };
       };
 
       monitoring.enable = mkEnableOption "per-service nftables egress counters";
     };
   };
 
-  config = mkIf (cfg.enable && cfg.egress.enable) {
-    assertions = [
-      {
-        assertion = config.networking.nftables.enable;
-        message = "utils.vnet.egress requires networking.nftables.enable.";
-      }
-      {
-        assertion = prefixDelegationName == null || hasPrefixDelegation;
-        message = "utils.vnet.egress.ipv6.prefixDelegation refers to a missing or disabled prefix delegation.";
-      }
-      {
-        assertion = builtins.all (link: link.service.privateNetwork) egressLinks;
-        message = "utils.vnet egress links must originate in a private service network namespace.";
-      }
-      {
-        assertion = builtins.all (link: link.interface.addresses == [ ]) egressLinks;
-        message = "utils.vnet egress interface addresses are allocated automatically and must be empty.";
-      }
-      {
-        assertion = builtins.length allocatedIds == builtins.length (unique allocatedIds);
-        message = "utils.vnet egress addressId values must be unique.";
-      }
-      {
-        assertion = builtins.all (addressId: addressId > 1 && addressId <= ipv4Pool.capacity) allocatedIds;
-        message = "utils.vnet egress addressId values must fit the IPv4 pool and may not use host ID 1.";
-      }
-      {
-        assertion = builtins.all
-          (
-            delegation: builtins.hasAttr delegation.network config.systemd.network.networks
-          )
-          (builtins.attrValues enabledPrefixDelegations);
-        message = "utils.vnet.prefixDelegations.*.network must name an existing systemd network.";
-      }
-    ];
-
-    boot.kernel.sysctl = {
-      "net.ipv4.ip_forward" = lib.mkDefault 1;
-      "net.ipv6.conf.all.forwarding" = lib.mkDefault 1;
-      "net.ipv6.conf.default.forwarding" = lib.mkDefault 1;
-    };
-
-    systemd.network = {
-      netdevs = prefixDelegationNetdevs;
-      networks = mkMerge [ upstreamNetworks prefixDelegationNetworks ];
-    };
-
-    systemd.services = mkMerge [
-      {
-        vnet-egress-host = {
-          description = "Configure the shared vnet host egress endpoint";
-          wantedBy = [ "multi-user.target" ];
-          after = [ "systemd-networkd.service" ];
-          serviceConfig = {
-            Type = "oneshot";
-            RemainAfterExit = true;
-            ExecStart = "${ip} address replace ${hostAddress}/32 dev lo";
-            ExecStop = "-${ip} address del ${hostAddress}/32 dev lo";
-          };
-        };
-      }
-      egressLinkDropins
-      egressDnsDropins
-      (optionalAttrs hasPrefixDelegation {
-        vnet-egress-prefix-watch = {
-          description = "Synchronize delegated IPv6 addresses into vnet namespaces";
-          wantedBy = [ "multi-user.target" ];
-          wants = [ (deviceUnit pdDevice) ];
-          after = [ "systemd-networkd.service" (deviceUnit pdDevice) ];
-          serviceConfig = {
-            Type = "simple";
-            ExecStart = lib.getExe prefixWatcher;
-            Restart = "always";
-            RestartSec = 1;
-          };
-        };
-      })
-    ];
-
-    networking.nftables.tables.vnet-egress = {
-      family = "inet";
-      content = ''
-        ${counterDefinitions}
-
-        chain input {
-          type filter hook input priority -20; policy accept;
-
-          ${lib.optionalString (egressLinks != [ ]) ''
-            iifname { ${inputInterfaces} } ip daddr ${hostAddress} accept
-          ''}
-          ip daddr ${hostAddress} drop
+  config = mkMerge [
+    {
+      utils.vnet.egress.peerAddr =
+        if cfg.enable && cfg.egress.enable then hostAddress else "";
+    }
+    (mkIf (cfg.enable && cfg.egress.enable) {
+      assertions = [
+        {
+          assertion = config.networking.nftables.enable;
+          message = "utils.vnet.egress requires networking.nftables.enable.";
         }
-
-        chain forward {
-          type filter hook forward priority -20; policy accept;
-
-          ${forwardRules}
+        {
+          assertion =
+            !config.networking.firewall.enable
+            || config.networking.firewall.backend == "nftables";
+          message = "utils.vnet.egress requires the nftables NixOS firewall backend when networking.firewall.enable is true.";
         }
+        {
+          assertion = prefixDelegationName == null || hasPrefixDelegation;
+          message = "utils.vnet.egress.ipv6.prefixDelegation refers to a missing or disabled prefix delegation.";
+        }
+        {
+          assertion = ipv6Links == [ ] || hasPrefixDelegation;
+          message = "utils.vnet services with egress.enableIPv6 require utils.vnet.egress.ipv6.prefixDelegation.";
+        }
+        {
+          assertion =
+            builtins.length prefixDelegationDevices
+            == builtins.length (unique prefixDelegationDevices);
+          message = "utils.vnet prefix delegation names must remain unique after truncation to Linux interface names.";
+        }
+        {
+          assertion = builtins.all
+            (addressId: addressId <= ipv4Pool.capacity)
+            allocatedIds;
+          message = "utils.vnet private services do not fit in utils.vnet.egress.ipv4.pool.";
+        }
+        {
+          assertion = builtins.all
+            (
+              delegation: builtins.hasAttr delegation.network config.systemd.network.networks
+            )
+            (builtins.attrValues enabledPrefixDelegations);
+          message = "utils.vnet.prefixDelegations.*.network must name an existing systemd network.";
+        }
+      ];
 
-        ${lib.optionalString cfg.egress.ipv4.masquerade ''
-          chain postrouting {
-            type nat hook postrouting priority srcnat; policy accept;
+      boot.kernel.sysctl = {
+        "net.ipv4.ip_forward" = lib.mkDefault 1;
+        "net.ipv6.conf.all.forwarding" = lib.mkDefault 1;
+        "net.ipv6.conf.default.forwarding" = lib.mkDefault 1;
+      };
 
-            ip saddr ${ipv4Pool.network} oifname "${cfg.egress.uplink}" masquerade
+      systemd.network = {
+        netdevs = prefixDelegationNetdevs;
+        networks = mkMerge [ upstreamNetworks prefixDelegationNetworks ];
+      };
+
+      systemd.services = mkMerge [
+        {
+          vnet-egress-host = {
+            description = "Configure the shared vnet host egress endpoint";
+            wantedBy = [ "multi-user.target" ];
+            after = [ "systemd-networkd.service" ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              ExecStart = "${ip} address replace ${hostAddress}/32 dev lo";
+              ExecStop = "-${ip} address del ${hostAddress}/32 dev lo";
+            };
+          };
+        }
+        (optionalAttrs config.services.resolved.enable {
+          systemd-resolved = {
+            requires = [ "vnet-egress-host.service" ];
+            after = [ "vnet-egress-host.service" ];
+          };
+        })
+        egressLinkDropins
+        egressDnsDropins
+        (optionalAttrs hasPrefixDelegation {
+          vnet-egress-prefix-watch = {
+            description = "Synchronize delegated IPv6 addresses into vnet namespaces";
+            wantedBy = [ "multi-user.target" ];
+            wants = [ (deviceUnit pdDevice) ];
+            after = [ "systemd-networkd.service" (deviceUnit pdDevice) ];
+            serviceConfig = {
+              Type = "simple";
+              ExecStart = lib.getExe prefixWatcher;
+              Restart = "always";
+              RestartSec = 1;
+            };
+          };
+        })
+      ];
+
+      networking.nftables.tables.vnet-egress = {
+        family = "inet";
+        content = ''
+          ${counterDefinitions}
+
+          chain input {
+            type filter hook input priority -20; policy accept;
+
+            ${lib.optionalString (egressLinks != [ ]) ''
+              iifname { ${inputInterfaces} } ip daddr ${hostAddress} udp dport 53 accept
+              iifname { ${inputInterfaces} } ip daddr ${hostAddress} tcp dport 53 accept
+            ''}
+            ip daddr ${hostAddress} drop
           }
-        ''}
-      '';
-    };
 
-    services.resolved.settings.Resolve.DNSStubListenerExtra = mkIf
-      config.services.resolved.enable
-      [ hostAddress ];
-  };
+          chain forward {
+            type filter hook forward priority -20; policy accept;
+
+            ${forwardRules}
+          }
+
+          ${lib.optionalString (cfg.egress.ipv4.masquerade && internetLinks != [ ]) ''
+            chain postrouting {
+              type nat hook postrouting priority srcnat; policy accept;
+
+              ip saddr { ${concatStringsSep ", " (map (link: addressIP link.ipv4Address) internetLinks)} } oifname "${cfg.egress.uplink}" masquerade
+            }
+          ''}
+        '';
+      };
+
+      networking.firewall = mkIf config.networking.firewall.enable {
+        backend = lib.mkDefault "nftables";
+        extraInputRules = lib.mkAfter (optionalString (egressLinks != [ ]) ''
+          iifname { ${inputInterfaces} } ip daddr ${hostAddress} udp dport 53 accept
+          iifname { ${inputInterfaces} } ip daddr ${hostAddress} tcp dport 53 accept
+        '');
+        extraForwardRules = lib.mkAfter firewallForwardRules;
+      };
+
+      services.resolved.settings.Resolve.DNSStubListenerExtra = mkIf
+        config.services.resolved.enable
+        [ hostAddress ];
+    })
+  ];
 }

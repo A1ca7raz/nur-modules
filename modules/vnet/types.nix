@@ -1,8 +1,9 @@
 {
   gatewayModule =
-    { lib, ... }:
+    { name, lib, ... }:
     let
       inherit (lib) mkOption types;
+      vnetLib = import ./lib.nix { inherit lib; };
     in
     {
       options = {
@@ -23,7 +24,15 @@
           default = [ ];
           description = "Addresses assigned to the gateway device.";
         };
+
+        device = mkOption {
+          type = types.str;
+          readOnly = true;
+          description = "Generated Linux interface name for this gateway.";
+        };
       };
+
+      config.device = vnetLib.gatewayDevice name;
     };
 
   defaultRouteModule =
@@ -81,21 +90,7 @@
         addresses = mkOption {
           type = with types; coercedTo str (address: [ address ]) (listOf str);
           default = [ ];
-          description = ''
-            Addresses assigned to this service interface. May be empty for an
-            egress interface peered with the built-in host target; its IPv4
-            address is then allocated from utils.vnet.egress.ipv4.pool.
-          '';
-        };
-
-        addressId = mkOption {
-          type = with types; nullOr ints.positive;
-          default = null;
-          description = ''
-            Optional stable host ID for an automatically allocated egress
-            address. The same ID is used for the IPv4 pool and delegated IPv6
-            prefix. Null allocates the first available ID deterministically.
-          '';
+          description = "Addresses assigned to this service interface.";
         };
 
         gateway = mkOption {
@@ -128,11 +123,41 @@
       };
     };
 
-  serviceModule =
-    { name, lib, ... }:
+  serviceEgressModule =
+    { lib, ... }:
     let
       inherit (lib) mkOption types;
-      inherit (import ./types.nix) interfaceModule;
+    in
+    {
+      options = {
+        enable = mkOption {
+          type = types.bool;
+          default = false;
+          description = "Whether this service may initiate public IPv4 connections.";
+        };
+
+        enableIPv6 = mkOption {
+          type = types.bool;
+          default = true;
+          description = ''
+            Whether public IPv6 is enabled when egress.enable is true. Disabled
+            services are not assigned an address from the delegated prefix.
+          '';
+        };
+
+        peerAddr = mkOption {
+          type = types.str;
+          readOnly = true;
+          description = "Automatically allocated IPv4 address on the service side of the host transit peer.";
+        };
+      };
+    };
+
+  serviceModule =
+    { name, lib, config, vnetEgressPeerAddr ? (_: ""), ... }:
+    let
+      inherit (lib) mkOption types;
+      inherit (import ./types.nix) interfaceModule serviceEgressModule;
     in
     {
       options = {
@@ -163,11 +188,20 @@
           description = "Reusable /32 or /128 endpoint owned by this service namespace.";
         };
 
+        egress = mkOption {
+          type = types.submodule serviceEgressModule;
+          default = { };
+          description = "Public egress policy and the computed host-transit peer address.";
+        };
+
         interfaces = mkOption {
           type = with types; attrsOf (submodule interfaceModule);
           default = { };
           description = "Network interfaces attached to this service namespace.";
         };
       };
+
+      config.egress.peerAddr =
+        if config.enable && config.privateNetwork then vnetEgressPeerAddr name else "";
     };
 }

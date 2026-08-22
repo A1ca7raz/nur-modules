@@ -31,15 +31,71 @@ let
       (builtins.bitAnd (builtins.div value 256) 255)
       (builtins.bitAnd value 255)
     ];
+
+  parseIPv4CIDR = cidr:
+    let
+      parts = splitString "/" cidr;
+      address = if parts == [ ] then "" else builtins.head parts;
+      prefixLength = if builtins.length parts == 2 then toInt (builtins.elemAt parts 1) else -1;
+      addressValue = ipv4ToInt address;
+      hostBits = 32 - prefixLength;
+      size = if prefixLength >= 0 && prefixLength <= 32 then pow 2 hostBits else 0;
+      hostMask = size - 1;
+      networkValue = builtins.bitAnd addressValue (4294967295 - hostMask);
+    in
+    if builtins.length parts != 2 || prefixLength < 0 || prefixLength > 32 then
+      throw "${cidr} must be an IPv4 CIDR with prefix length 0..32"
+    else
+      {
+        inherit prefixLength size networkValue;
+        network = "${intToIPv4 networkValue}/${toString prefixLength}";
+      };
 in
 rec {
   hash = value: builtins.hashString "sha256" value;
   shortHash = value: builtins.substring 0 11 (hash value);
+  sanitizeName = value:
+    lib.concatMapStrings
+      (
+        character:
+        if builtins.match "[A-Za-z0-9_.-]" character != null then character else "-"
+      )
+      (lib.stringToCharacters value);
+  nftIdentifier = value:
+    lib.concatMapStrings
+      (
+        character:
+        if builtins.match "[A-Za-z0-9_]" character != null then character else "_"
+      )
+      (lib.stringToCharacters value);
   kernelName = prefix: value:
-    "${prefix}${builtins.substring 0 (15 - builtins.stringLength prefix) (hash value)}";
+    let
+      available = 15 - builtins.stringLength prefix;
+      sanitized = sanitizeName value;
+    in
+    if available < 1 then
+      throw "vnet interface prefix ${prefix} is too long"
+    else
+      "${prefix}${builtins.substring 0 available sanitized}";
 
-  gatewayDevice = name: kernelName "gw" "gateway:${name}";
-  prefixDelegationDevice = name: kernelName "pd" "prefix-delegation:${name}";
+  gatewayDevice = name: kernelName "vbr-" name;
+  prefixDelegationDevice = name: kernelName "vpd-" name;
+
+  linkName = serviceName: interfaceName:
+    sanitizeName (
+      if lib.hasPrefix "${serviceName}-" interfaceName then
+        interfaceName
+      else
+        "${serviceName}-${interfaceName}"
+    );
+  gatewayLinkServiceName = serviceName: interfaceName:
+    "vnet-gateway-${linkName serviceName interfaceName}";
+  egressLinkServiceName = serviceName:
+    "vnet-egress-${sanitizeName serviceName}";
+  peerLinkServiceName = members:
+    "vnet-peer-${lib.concatMapStringsSep "-and-" (
+      member: linkName member.serviceName member.interfaceName
+    ) members}";
 
   macAddress = value:
     let
@@ -54,10 +110,16 @@ rec {
       (builtins.substring 8 2 digest)
     ];
 
-  peerLinkNames = key: {
-    sourceInterface = kernelName "p0" "peer-source:${key}";
-    targetInterface = kernelName "p1" "peer-target:${key}";
-    targetFinalInterface = "peer-${builtins.substring 0 10 (hash key)}";
+  peerLinkNames = value: key: {
+    sourceInterface = kernelName "vp0-" value;
+    targetInterface = kernelName "vp1-" value;
+    sourceMac = macAddress "peer-source:${key}";
+    targetMac = macAddress "peer-target:${key}";
+  };
+
+  egressPeerLinkNames = value: key: {
+    sourceInterface = kernelName "vpe0-" value;
+    targetInterface = kernelName "vpe-" value;
     sourceMac = macAddress "peer-source:${key}";
     targetMac = macAddress "peer-target:${key}";
   };
@@ -76,29 +138,17 @@ rec {
       )
       (builtins.attrNames services);
 
-  isEgressLink = cfg: link:
-    cfg.egress.enable
-    && link.interface.peer != null
-    && link.interface.peer.service == "host"
-    && link.interface.defaultRoute != null;
+  ipv4Network = cidr: (parseIPv4CIDR cidr).network;
 
   parseIPv4Pool = pool:
     let
-      parts = splitString "/" pool;
-      address = if parts == [ ] then "" else builtins.head parts;
-      prefixLength = if builtins.length parts == 2 then toInt (builtins.elemAt parts 1) else -1;
-      addressValue = ipv4ToInt address;
-      hostBits = 32 - prefixLength;
-      size = if prefixLength >= 0 && prefixLength <= 32 then pow 2 hostBits else 0;
-      hostMask = size - 1;
-      networkValue = builtins.bitAnd addressValue (4294967295 - hostMask);
+      parsed = parseIPv4CIDR pool;
+      inherit (parsed) prefixLength size networkValue;
     in
-    if builtins.length parts != 2 || prefixLength < 1 || prefixLength > 30 then
+    if prefixLength < 1 || prefixLength > 30 then
       throw "utils.vnet.egress.ipv4.pool must be an IPv4 CIDR with prefix length 1..30"
     else
-      {
-        inherit prefixLength size networkValue;
-        network = "${intToIPv4 networkValue}/${toString prefixLength}";
+      parsed // {
         capacity = size - 2;
         addressAt = addressId:
           if addressId < 1 || addressId > size - 2 then
@@ -107,38 +157,54 @@ rec {
             intToIPv4 (networkValue + addressId);
       };
 
+  egressAddressId = services: serviceName:
+    2 + lib.lists.findFirstIndex
+      (candidate: candidate == serviceName)
+      (throw "missing utils.vnet service ${serviceName}")
+      (builtins.attrNames services);
+
   allocateEgressLinks = cfg: services:
     let
       pool = parseIPv4Pool cfg.egress.ipv4.pool;
-      links = filter (isEgressLink cfg) (rawLinks services);
-      explicitIds = map (link: link.interface.addressId) (
-        filter (link: link.interface.addressId != null) links
-      );
-      nextFree = used: candidate:
-        if builtins.elem candidate used then nextFree used (candidate + 1) else candidate;
-      allocation = foldl'
+      serviceNames = builtins.attrNames services;
+      privateServiceNames = filter
         (
-          state: link:
-            let
-              addressId =
-                if link.interface.addressId != null then
-                  link.interface.addressId
-                else
-                  nextFree (explicitIds ++ state.used) 2;
-              names = peerLinkNames link.key;
-            in
-            {
-              used = state.used ++ [ addressId ];
-              links = state.links ++ [
-                (link // names // {
-                  inherit addressId;
-                  ipv4Address = "${pool.addressAt addressId}/32";
-                })
-              ];
-            }
+          serviceName:
+          services.${serviceName}.enable && services.${serviceName}.privateNetwork
         )
-        { used = [ 1 ]; links = [ ]; }
-        links;
+        serviceNames;
     in
-    allocation.links;
+    if !cfg.egress.enable then
+      [ ]
+    else
+      map
+        (
+          serviceName:
+          let
+            service = services.${serviceName};
+            addressId = egressAddressId services serviceName;
+            key = "${serviceName}:vnet-egress";
+          in
+          ({
+            inherit key serviceName service addressId;
+            interfaceName = "vnet-egress";
+            interface = {
+              addresses = [ ];
+              gateway = null;
+              peer = {
+                service = "host";
+                endpoint = null;
+              };
+              defaultRoute =
+                if service.egress.enable then {
+                  via = null;
+                  metric = null;
+                } else null;
+            };
+            ipv4Address = "${pool.addressAt addressId}/32";
+            internet = service.egress.enable;
+            ipv6 = service.egress.enable && service.egress.enableIPv6;
+          } // egressPeerLinkNames serviceName key)
+        )
+        privateServiceNames;
 }

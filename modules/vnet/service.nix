@@ -36,10 +36,14 @@ let
   vnetLib = import ./lib.nix { inherit lib; };
   inherit (vnetLib)
     allocateEgressLinks
-    gatewayDevice
+    egressLinkServiceName
+    gatewayLinkServiceName
+    ipv4Network
     kernelName
     macAddress
+    nftIdentifier
     peerLinkNames
+    peerLinkServiceName
     rawLinks
     shortHash
     ;
@@ -68,8 +72,9 @@ let
   deviceUnit = interface: "sys-subsystem-net-devices-${utils.escapeSystemdPath interface}.device";
   netnsUnit = service: "netns@${service}.service";
 
-  allRawLinks = rawLinks enabledServices;
-  allocatedEgressLinks = allocateEgressLinks cfg enabledServices;
+  declaredRawLinks = rawLinks enabledServices;
+  allocatedEgressLinks = allocateEgressLinks cfg cfg.services;
+  allRawLinks = declaredRawLinks ++ allocatedEgressLinks;
   egressServiceNames = unique (builtins.map (link: link.serviceName) allocatedEgressLinks);
   egressLinksByKey = builtins.listToAttrs (
     builtins.map (link: nameValuePair link.key link) allocatedEgressLinks
@@ -107,15 +112,18 @@ let
       index:
       let
         link = builtins.elemAt validGatewayLinks index;
-        linkHash = shortHash "gateway-link:${link.key}";
       in
       link
       // {
         type = "gateway";
-        setupService = "netns-link-${linkHash}";
-        unit = "netns-link-${linkHash}.service";
-        hostInterface = kernelName "gh" "gateway-host:${link.key}";
-        serviceInterface = kernelName "gs" "gateway-service:${link.key}";
+        setupService = gatewayLinkServiceName link.serviceName link.interfaceName;
+        hostInterface = kernelName "vg-" (
+          if lib.hasPrefix "${link.serviceName}-" link.interfaceName then
+            link.interfaceName
+          else
+            "${link.serviceName}-${link.interfaceName}"
+        );
+        serviceInterface = kernelName "vgs${toString index}-" link.key;
         hostMac = macAddress "gateway-host:${link.key}";
         serviceMac = macAddress "gateway-service:${link.key}";
         gateway = link.interface.gateway;
@@ -135,15 +143,23 @@ let
     (
       groupKey: members: {
         key = "host-peer:${groupKey}";
+        macKey =
+          let
+            link = builtins.head members;
+          in
+          "host-peer:${shortHash (
+            "${link.interface.peer.service}:${builtins.toJSON (effectivePeerEndpoints link)}"
+          )}";
         inherit members;
       }
     )
     (groupBy
       (
         link:
-        shortHash (
-          "${link.interface.peer.service}:${builtins.toJSON (effectivePeerEndpoints link)}"
-        )
+        builtins.toJSON {
+          targetService = link.interface.peer.service;
+          endpoints = effectivePeerEndpoints link;
+        }
       )
       (filter (link: !link.service.privateNetwork) validPeerLinks));
 
@@ -152,16 +168,29 @@ let
       group:
       let
         link = builtins.head group.members;
-        linkHash = shortHash "peer-link:${group.key}";
-        names = peerLinkNames group.key;
+        names =
+          if isEgressLink link then
+            {
+              inherit (link)
+                sourceInterface
+                targetInterface
+                sourceMac
+                targetMac
+                ;
+            }
+          else
+            peerLinkNames link.serviceName (group.macKey or group.key);
       in
       link
       // names
       // {
         key = group.key;
         type = "peer";
-        setupService = "netns-link-${linkHash}";
-        unit = "netns-link-${linkHash}.service";
+        setupService =
+          if isEgressLink link then
+            egressLinkServiceName link.serviceName
+          else
+            peerLinkServiceName group.members;
         targetService = link.interface.peer.service;
         endpoints = effectivePeerEndpoints link;
         sourceAddresses = unique (
@@ -173,12 +202,24 @@ let
         );
         targetIsHost = link.interface.peer.service == "host";
         egress = isEgressLink link;
+        egressIPv6 = isEgressLink link && egressLinksByKey.${link.key}.ipv6;
         inherit (group) members;
       }
     )
     (privatePeerGroups ++ hostPeerGroups);
 
   allLinks = gatewayLinks ++ peerLinks;
+
+  businessIPv4Networks = unique (
+    concatMap
+      (
+        gateway:
+        builtins.map ipv4Network (
+          filter (address: !isIPv6 address) gateway.addresses
+        )
+      )
+      (builtins.attrValues enabledGateways)
+  );
 
   replyRoutingEnabled = link:
     link.interface.gateway != null
@@ -200,24 +241,22 @@ let
   namespacedIpCommand = namespace: args:
     ipCommand (namespaceArgs namespace ++ args);
 
-  moveAndRename = namespace: temporary: final: [
-    (ipCommand [ "link" "set" "dev" temporary "netns" namespace ])
-    (ipCommand [ "-n" namespace "link" "set" "dev" temporary "name" final ])
-  ];
+  moveAndRename = namespace: temporary: final:
+    [ (ipCommand [ "link" "set" "dev" temporary "netns" namespace ]) ]
+    ++ optional
+      (temporary != final)
+      (ipCommand [ "-n" namespace "link" "set" "dev" temporary "name" final ]);
 
-  returnToInitialNamespace = namespace: temporary: final: [
-    (ignored (ipCommand [ "-n" namespace "link" "set" "dev" final "name" temporary ]))
-    (ignored (ipCommand [ "-n" namespace "link" "set" "dev" temporary "netns" "1" ]))
-  ];
-
-  addressCommand = namespace: interface: address:
-    ipCommand (
-      [ "-n" namespace "address" "replace" (normalizeAddress address) "dev" interface ]
-      ++ optionals (isIPv6 address) [ "nodad" ]
-    );
+  returnToInitialNamespace = namespace: temporary: final:
+    optional
+      (temporary != final)
+      (ignored (ipCommand [ "-n" namespace "link" "set" "dev" final "name" temporary ]))
+    ++ [
+      (ignored (ipCommand [ "-n" namespace "link" "set" "dev" temporary "netns" "1" ]))
+    ];
 
   addressCommands = namespace: interface: addresses:
-    builtins.map (addressCommand namespace interface) addresses;
+    builtins.map (namespacedAddressCommand namespace interface) addresses;
 
   namespacedAddressCommand = namespace: interface: address:
     namespacedIpCommand namespace (
@@ -459,7 +498,8 @@ let
         (unique (builtins.map family link.interface.addresses))
     );
 
-  replyRoutingTableName = link: "vnet_reply_${shortHash link.key}";
+  replyRoutingTableName = link:
+    "vnet_reply_${nftIdentifier (vnetLib.linkName link.serviceName link.interfaceName)}";
   replyRoutingFirewall = link:
     let
       mark = toString link.replyRouteTable;
@@ -494,10 +534,10 @@ let
           } accept
           oifname "${link.interfaceName}" ct mark != ${mark} drop
           ${optionalString (ipv4Addresses != [ ]) ''
-            ip saddr { ${concatStringsSep ", " ipv4Addresses} } ct mark != ${mark} drop
+            oifname != "lo" ip saddr { ${concatStringsSep ", " ipv4Addresses} } ct mark != ${mark} drop
           ''}
           ${optionalString (ipv6Addresses != [ ]) ''
-            ip6 saddr { ${concatStringsSep ", " ipv6Addresses} } ct mark != ${mark} drop
+            oifname != "lo" ip6 saddr { ${concatStringsSep ", " ipv6Addresses} } ct mark != ${mark} drop
           ''}
         }
       }
@@ -544,8 +584,7 @@ let
         if link.targetIsHost then null else serviceNamespace link.targetService;
       sourceFinal =
         if sourceNamespace == null then link.sourceInterface else link.interfaceName;
-      targetFinal =
-        if targetNamespace == null then link.targetInterface else link.targetFinalInterface;
+      targetFinal = link.targetInterface;
       sourceAddresses = link.sourceAddresses;
       targetEndpoints = builtins.map normalizeAddress link.endpoints;
       hostLinkLocal = "fe80::${lib.network.ipv6.mkEUI64Suffix link.targetMac}";
@@ -626,7 +665,7 @@ let
         )
         sourceAddresses;
 
-      egressIPv6Commands = optionals (link.egress && cfg.egress.ipv6.prefixDelegation != null) [
+      egressIPv6Commands = optionals link.egressIPv6 [
         (namespacedAddressCommand targetNamespace targetFinal "${hostLinkLocal}/64")
         (namespacedIpCommand sourceNamespace [
           "-6"
@@ -693,6 +732,69 @@ let
           )
           targetEndpoints
       );
+
+      businessRouteTable = "9000";
+      businessRoutePriority = "9000";
+      businessRouteCommands = optionals (link.egress && businessIPv4Networks != [ ]) (
+        [
+          (namespacedIpCommand sourceNamespace [
+            "-4"
+            "route"
+            "replace"
+            (hostPrefix (builtins.head targetEndpoints))
+            "dev"
+            sourceFinal
+            "scope"
+            "link"
+            "src"
+            (firstAddress "ipv4" sourceAddresses)
+            "table"
+            businessRouteTable
+          ])
+        ]
+        ++ concatMap
+          (
+            network: [
+              (namespacedIpCommand sourceNamespace [
+                "-4"
+                "route"
+                "replace"
+                network
+                "via"
+                (addressIP (builtins.head targetEndpoints))
+                "dev"
+                sourceFinal
+                "src"
+                (firstAddress "ipv4" sourceAddresses)
+                "table"
+                businessRouteTable
+              ])
+              (ignored (namespacedIpCommand sourceNamespace [
+                "-4"
+                "rule"
+                "delete"
+                "priority"
+                businessRoutePriority
+                "to"
+                network
+                "table"
+                businessRouteTable
+              ]))
+              (namespacedIpCommand sourceNamespace [
+                "-4"
+                "rule"
+                "add"
+                "priority"
+                businessRoutePriority
+                "to"
+                network
+                "table"
+                businessRouteTable
+              ])
+            ]
+          )
+          businessIPv4Networks
+      );
     in
     sourceMove
     ++ targetMove
@@ -705,6 +807,7 @@ let
     ++ sourceNeighbors
     ++ targetRoutes
     ++ targetNeighbors
+    ++ businessRouteCommands
     ++ peerDefaultRoutes
     ++ egressIPv6Commands;
 
@@ -714,7 +817,7 @@ let
       devices = builtins.map deviceUnit [
         link.hostInterface
         link.serviceInterface
-        (gatewayDevice link.gateway)
+        enabledGateways.${link.gateway}.device
       ];
     in
     {
@@ -753,7 +856,7 @@ let
             returnToInitialNamespace link.serviceName link.sourceInterface link.interfaceName
           )
         ++ optionals (targetNamespace != null) (
-          returnToInitialNamespace link.targetService link.targetInterface link.targetFinalInterface
+          returnToInitialNamespace link.targetService link.targetInterface link.targetInterface
         );
     in
     {
@@ -782,7 +885,7 @@ let
   );
 
   linksForService = serviceName:
-    builtins.map (link: link.unit) (
+    builtins.map (link: "${link.setupService}.service") (
       filter
         (
           link:
@@ -826,7 +929,7 @@ let
           overrideStrategy = "asDropin";
           serviceConfig.ExecStartPost = builtins.map
             (
-              addressCommand serviceName "lo"
+              namespacedAddressCommand serviceName "lo"
             )
             endpoints;
         }
@@ -868,7 +971,7 @@ let
     builtins.map
       (
         link:
-        nameValuePair "40-netns-link-${shortHash link.key}" {
+        nameValuePair "40-${link.setupService}" {
           netdevConfig = {
             Name = link.hostInterface;
             Kind = "veth";
@@ -887,7 +990,7 @@ let
     builtins.map
       (
         link:
-        nameValuePair "40-netns-link-${shortHash link.key}" {
+        nameValuePair "40-${link.setupService}" {
           netdevConfig = {
             Name = link.sourceInterface;
             Kind = "veth";
@@ -906,11 +1009,11 @@ let
     builtins.map
       (
         link:
-        nameValuePair "40-netns-link-${shortHash link.key}" {
+        nameValuePair "40-${link.setupService}" {
           matchConfig.Name = link.hostInterface;
           linkConfig.RequiredForOnline = false;
           networkConfig = {
-            Bridge = gatewayDevice link.gateway;
+            Bridge = enabledGateways.${link.gateway}.device;
             ConfigureWithoutCarrier = true;
           };
         }
@@ -991,7 +1094,7 @@ let
         }
         {
           assertion = addresses != [ ];
-          message = "utils.vnet.services.${link.serviceName}.interfaces.${link.interfaceName}.addresses must not be empty unless allocated by utils.vnet.egress.";
+          message = "utils.vnet.services.${link.serviceName}.interfaces.${link.interfaceName}.addresses must not be empty.";
         }
         {
           assertion = !hasGateway || builtins.hasAttr link.interface.gateway enabledGateways;
@@ -1073,10 +1176,6 @@ let
           message = "utils.vnet.services.${link.serviceName}.interfaces.${link.interfaceName} may peer with host only as a default-route egress interface.";
         }
         {
-          assertion = link.interface.addressId == null || egress;
-          message = "utils.vnet.services.${link.serviceName}.interfaces.${link.interfaceName}.addressId is only valid for host egress interfaces.";
-        }
-        {
           assertion = !hasGateway || link.service.privateNetwork;
           message = "Host-network services cannot attach to a utils.vnet gateway.";
         }
@@ -1098,6 +1197,19 @@ let
       serviceName:
       let
         service = enabledServices.${serviceName};
+        namespaceInterfaceNames =
+          builtins.attrNames service.interfaces
+          ++ optional (builtins.elem serviceName egressServiceNames) "vnet-egress"
+          ++ builtins.map
+            (link: link.targetInterface)
+            (filter
+              (
+                link:
+                !link.targetIsHost
+                && link.targetService == serviceName
+                && service.privateNetwork
+              )
+              peerLinks);
       in
       [
         {
@@ -1114,6 +1226,25 @@ let
             && builtins.match "[A-Za-z0-9@%:_.-]+" service.unit != null;
           message = "utils.vnet.services.${serviceName}.unit must be a systemd.services attribute name without the .service suffix.";
         }
+        {
+          assertion = service.privateNetwork || !service.egress.enable;
+          message = "utils.vnet.services.${serviceName}.egress.enable requires privateNetwork = true.";
+        }
+        {
+          assertion = cfg.egress.enable || !service.egress.enable;
+          message = "utils.vnet.services.${serviceName}.egress.enable requires utils.vnet.egress.enable.";
+        }
+        {
+          assertion = !builtins.hasAttr "vnet-egress" service.interfaces;
+          message = "utils.vnet.services.${serviceName}.interfaces.vnet-egress is reserved for the automatic host transit peer.";
+        }
+        {
+          assertion =
+            !service.privateNetwork
+            || builtins.length namespaceInterfaceNames
+            == builtins.length (unique namespaceInterfaceNames);
+          message = "Generated and declared interface names in the ${serviceName} network namespace must be unique.";
+        }
       ]
     )
     (builtins.attrNames enabledServices);
@@ -1127,6 +1258,51 @@ let
       assertion = false;
       message = "Enabled utils.vnet.services entries must reference distinct systemd service units.";
     };
+
+  generatedHostInterfaceNames = concatMap
+    (
+      link:
+      if link.type == "gateway" then
+        [ link.hostInterface link.serviceInterface ]
+      else
+        [ link.sourceInterface link.targetInterface ]
+    )
+    allLinks;
+  uniqueGeneratedHostInterfaceAssertion = optional
+    (
+      builtins.length generatedHostInterfaceNames
+      != builtins.length (unique generatedHostInterfaceNames)
+    )
+    {
+      assertion = false;
+      message = "Generated utils.vnet host interface names must remain unique after truncation.";
+    };
+
+  generatedLinkServiceNames = builtins.map (link: link.setupService) allLinks;
+  generatedLinkServiceAssertions = [
+    {
+      assertion =
+        builtins.length generatedLinkServiceNames
+        == builtins.length (unique generatedLinkServiceNames);
+      message = "Generated utils.vnet link service names must be unique.";
+    }
+    {
+      assertion = builtins.all
+        (name: builtins.stringLength name <= 247)
+        generatedLinkServiceNames;
+      message = "Generated utils.vnet link service names must fit within the systemd unit name limit.";
+    }
+  ];
+
+  replyRoutingTableNames = builtins.map replyRoutingTableName (
+    filter replyRoutingEnabled gatewayLinks
+  );
+  replyRoutingTableNameAssertion = {
+    assertion =
+      builtins.length replyRoutingTableNames
+      == builtins.length (unique replyRoutingTableNames);
+    message = "Generated utils.vnet reply-routing nft table names must be unique.";
+  };
 
   hostNetworkNftablesAssertion = optional
     (
@@ -1181,7 +1357,16 @@ let
 in
 {
   options.utils.vnet.services = mkOption {
-    type = with types; attrsOf (submodule serviceModule);
+    type = with types; attrsOf (submoduleWith {
+      modules = [ serviceModule ];
+      specialArgs.vnetEgressPeerAddr = serviceName:
+        if !cfg.egress.enable then
+          ""
+        else
+          (vnetLib.parseIPv4Pool cfg.egress.ipv4.pool).addressAt (
+            vnetLib.egressAddressId cfg.services serviceName
+          );
+    });
     default = { };
     description = "Systemd services with dedicated network namespaces and interfaces.";
   };
@@ -1191,6 +1376,9 @@ in
       interfaceAssertions
       ++ serviceAssertions
       ++ uniqueServiceUnitAssertion
+      ++ uniqueGeneratedHostInterfaceAssertion
+      ++ generatedLinkServiceAssertions
+      ++ [ replyRoutingTableNameAssertion ]
       ++ hostNetworkNftablesAssertion
       ++ peerRouteAssertions
       ++ peerSourceAddressAssertions;

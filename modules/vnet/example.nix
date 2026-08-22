@@ -75,6 +75,7 @@
       proxy = {
         unit = "caddy";
         endpoint = "169.254.100.1";
+        egress.enable = true;
         # Gateway interfaces without a default route are automatically treated
         # as inbound/reply-only, regardless of whether the service has egress.
         interfaces = {
@@ -86,32 +87,25 @@
             gateway = "internal";
             addresses = "198.18.1.2/24";
           };
-          egress = {
-            peer = "host";
-            defaultRoute = true;
-          };
         };
       };
 
-      app1.interfaces = {
-        proxy = {
+      app1 = {
+        egress.enable = true;
+        interfaces.proxy = {
           addresses = "169.254.100.2";
           peer = "proxy";
         };
-        egress = {
-          peer = "host";
-          defaultRoute = true;
-        };
       };
 
-      app2.interfaces = {
-        proxy = {
+      app2 = {
+        egress = {
+          enable = true;
+          enableIPv6 = false;
+        };
+        interfaces.proxy = {
           addresses = "169.254.100.3";
           peer = "proxy";
-        };
-        egress = {
-          peer = "host";
-          defaultRoute = true;
         };
       };
 

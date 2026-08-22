@@ -7,15 +7,16 @@ let
     mkOption
     nameValuePair
     types
-  ;
+    unique
+    ;
 
   cfg = config.utils.vnet;
   enabledGateways = filterAttrs (_: gateway: gateway.enable) cfg.gateways;
   inherit (import ./types.nix) gatewayModule;
 
-  hash = value: builtins.hashString "sha256" value;
-  shortHash = value: builtins.substring 0 11 (builtins.hashString "sha256" value);
-  gatewayDevice = name: "gw${builtins.substring 0 13 (hash "gateway:${name}")}";
+  vnetLib = import ./lib.nix { inherit lib; };
+  inherit (vnetLib) sanitizeName;
+  gatewayDevices = map (gateway: gateway.device) (builtins.attrValues enabledGateways);
 in
 {
   options.utils.vnet.gateways = mkOption {
@@ -25,26 +26,37 @@ in
   };
 
   config = mkIf (cfg.enable && enabledGateways != { }) {
-    systemd.network.netdevs = mapAttrs' (
-      name: gateway:
-      nameValuePair "40-netns-gateway-${shortHash name}" {
-        netdevConfig = {
-          Name = gatewayDevice name;
-          Kind = gateway.type;
-        };
+    assertions = [
+      {
+        assertion = builtins.length gatewayDevices == builtins.length (unique gatewayDevices);
+        message = "utils.vnet gateway names must remain unique after truncation to Linux interface names.";
       }
-    ) enabledGateways;
+    ];
 
-    systemd.network.networks = mapAttrs' (
-      name: gateway:
-      nameValuePair "40-netns-gateway-${shortHash name}" {
-        matchConfig.Name = gatewayDevice name;
-        linkConfig.RequiredForOnline = false;
-        networkConfig = {
-          Address = gateway.addresses;
-          ConfigureWithoutCarrier = true;
-        };
-      }
-    ) enabledGateways;
+    systemd.network.netdevs = mapAttrs'
+      (
+        name: gateway:
+          nameValuePair "40-vnet-bridge-${sanitizeName name}" {
+            netdevConfig = {
+              Name = gateway.device;
+              Kind = gateway.type;
+            };
+          }
+      )
+      enabledGateways;
+
+    systemd.network.networks = mapAttrs'
+      (
+        name: gateway:
+          nameValuePair "40-vnet-bridge-${sanitizeName name}" {
+            matchConfig.Name = gateway.device;
+            linkConfig.RequiredForOnline = false;
+            networkConfig = {
+              Address = gateway.addresses;
+              ConfigureWithoutCarrier = true;
+            };
+          }
+      )
+      enabledGateways;
   };
 }
